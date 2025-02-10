@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+coap = "0.19"
+coap-lite = "0.11.3"
+tokio = {version = "^1.32", features = ["full"]}
