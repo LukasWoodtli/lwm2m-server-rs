@@ -871,8 +871,10 @@ checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
 name = "lwm2mserver-rs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "coap",
  "coap-lite",
+ "log",
  "tokio",
 ]
 
