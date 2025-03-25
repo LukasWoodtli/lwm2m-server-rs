@@ -45,3 +45,11 @@ jobs:
       run: |
         cargo fmt --version
         cargo fmt --all -- --check
+
+    - name: pre-commit
+      run: |
+        python3 -m venv .venv
+        . .venv/bin/activate
+        pip install pre-commit==4.2.0
+        pre-commit run --all-files
+      working-directory: .
