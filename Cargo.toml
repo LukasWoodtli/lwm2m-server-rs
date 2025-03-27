@@ -1,5 +1,5 @@
 [package]
-name = "lwm2mserver-rs"
+name = "lwm2m-server-rs"
 version = "0.1.0"
 edition = "2021"
 
