@@ -3,11 +3,7 @@ use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, Packet, ResponseType};
 use std::io::Error;
 use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-
-pub struct Lwm2mServer {
-    socket: UdpSocket,
-}
+use tokio::net::{ToSocketAddrs, UdpSocket};
 
 struct TransportMessage {
     peer_addr: SocketAddr,
@@ -23,19 +19,60 @@ impl TransportMessage {
     }
 }
 
-impl Lwm2mServer {
-    pub async fn new(address: &str) -> Result<Self, Error> {
-        let socket = UdpSocket::bind(address).await?;
+#[derive(Debug)]
+enum TransportError {
+    SetupError,
+}
 
-        Ok(Lwm2mServer { socket })
+struct UdpTransport {
+    socket: UdpSocket,
+}
+
+impl UdpTransport {
+    async fn from_address<A: ToSocketAddrs>(address: A) -> Result<Self, TransportError> {
+        let socket = UdpSocket::bind(address).await;
+        match socket {
+            Ok(socket) => Ok(UdpTransport { socket }),
+            Err(_) => Err(TransportError::SetupError),
+        }
+    }
+
+    async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
+        let len = self
+            .socket
+            .send_to(&msg.message_buf[..], msg.peer_addr)
+            .await?;
+        println!("Sent {} bytes", len);
+        Ok(())
+    }
+
+    async fn receive(&self) -> Result<TransportMessage, Error> {
+        let mut buf = vec![0; 1024];
+        let (len, addr) = self.socket.recv_from(&mut buf).await?;
+        println!("Received {} bytes from {:?}", len, addr);
+        Ok(TransportMessage::new(addr, Vec::from(&buf[..len])))
+    }
+}
+
+pub struct Lwm2mServer {
+    transport: UdpTransport,
+}
+
+impl Lwm2mServer {
+    pub async fn new(address: &str) -> Self {
+        let transport = UdpTransport::from_address(address)
+            .await
+            .expect("Failed to initialize transport");
+
+        Lwm2mServer { transport }
     }
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let msg = self.receive().await?;
+            let msg = self.transport.receive().await?;
 
             let response = self.handle_message(msg).await?;
 
-            self.send(response).await?;
+            self.transport.send(response).await?;
         }
     }
 
@@ -60,22 +97,6 @@ impl Lwm2mServer {
         }
         todo!();
     }
-
-    async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
-        let len = self
-            .socket
-            .send_to(&msg.message_buf[..], msg.peer_addr)
-            .await?;
-        println!("Sent {} bytes", len);
-        Ok(())
-    }
-
-    async fn receive(&self) -> Result<TransportMessage, Error> {
-        let mut buf = vec![0; 1024];
-        let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        println!("Received {} bytes from {:?}", len, addr);
-        Ok(TransportMessage::new(addr, Vec::from(&buf[..len])))
-    }
 }
 
 #[cfg(test)]
@@ -90,7 +111,7 @@ mod tests {
 
     fn spawn_server_for_tests(server_address: &'static str) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let s = Lwm2mServer::new(server_address).await.unwrap();
+            let s = Lwm2mServer::new(server_address).await;
             s.run().await.unwrap();
         })
     }
