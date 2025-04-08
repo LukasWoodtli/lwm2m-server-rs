@@ -9,6 +9,20 @@ pub struct Lwm2mServer {
     socket: UdpSocket,
 }
 
+struct TransportMessage {
+    peer_addr: SocketAddr,
+    message_buf: Vec<u8>,
+}
+
+impl TransportMessage {
+    fn new(peer_addr: SocketAddr, message_buf: Vec<u8>) -> Self {
+        TransportMessage {
+            peer_addr,
+            message_buf,
+        }
+    }
+}
+
 impl Lwm2mServer {
     pub async fn new(address: &str) -> Result<Self, Error> {
         let socket = UdpSocket::bind(address).await?;
@@ -17,36 +31,50 @@ impl Lwm2mServer {
     }
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let (addr, buf) = self.receive().await?;
+            let msg = self.receive().await?;
 
-            if let Ok(packet) = Packet::from_bytes(&buf[..]) {
-                let request = CoapRequest::from_packet(packet, addr);
+            let response = self.handle_message(msg).await?;
 
-                if let Some(mut response) = request.response {
-                    response.set_status(ResponseType::Created);
-                    response.message.clear_all_options();
-                    response.message.add_option(LocationPath, b"rd".to_vec());
-                    response
-                        .message
-                        .add_option_as(LocationPath, OptionValueString("01234".to_owned()));
-
-                    if let Ok(packet) = response.message.to_bytes() {
-                        let len = self.socket.send_to(&packet[..], addr).await?;
-                        println!("Sent {} bytes", len);
-                    } else {
-                        todo!()
-                    }
-                }
-            }
+            self.send(response).await?;
         }
     }
 
-    async fn receive(&self) -> Result<(SocketAddr, Vec<u8>), Error> {
+    async fn handle_message(&self, msg: TransportMessage) -> Result<TransportMessage, Error> {
+        if let Ok(packet) = Packet::from_bytes(&msg.message_buf[..]) {
+            let request = CoapRequest::from_packet(packet, msg.peer_addr);
+
+            if let Some(mut response) = request.response {
+                response.set_status(ResponseType::Created);
+                response.message.clear_all_options();
+                response.message.add_option(LocationPath, b"rd".to_vec());
+                response
+                    .message
+                    .add_option_as(LocationPath, OptionValueString("01234".to_owned()));
+
+                if let Ok(buffer) = response.message.to_bytes() {
+                    return Ok(TransportMessage::new(msg.peer_addr, buffer));
+                } else {
+                    todo!()
+                }
+            }
+        }
+        todo!();
+    }
+
+    async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
+        let len = self
+            .socket
+            .send_to(&msg.message_buf[..], msg.peer_addr)
+            .await?;
+        println!("Sent {} bytes", len);
+        Ok(())
+    }
+
+    async fn receive(&self) -> Result<TransportMessage, Error> {
         let mut buf = vec![0; 1024];
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
         println!("Received {} bytes from {:?}", len, addr);
-        let buf = Vec::from(&buf[..len]);
-        Ok((addr, buf))
+        Ok(TransportMessage::new(addr, Vec::from(&buf[..len])))
     }
 }
 
