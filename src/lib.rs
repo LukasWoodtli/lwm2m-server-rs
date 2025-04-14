@@ -5,7 +5,7 @@ use std::io::Error;
 use std::net::SocketAddr;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 
-struct TransportMessage {
+pub struct TransportMessage {
     peer_addr: SocketAddr,
     message_buf: Vec<u8>,
 }
@@ -20,8 +20,13 @@ impl TransportMessage {
 }
 
 #[derive(Debug)]
-enum TransportError {
+pub enum TransportError {
     SetupError,
+}
+
+trait Transport {
+    async fn send(&self, msg: TransportMessage) -> Result<(), Error>;
+    async fn receive(&self) -> Result<TransportMessage, Error>;
 }
 
 struct UdpTransport {
@@ -36,7 +41,9 @@ impl UdpTransport {
             Err(_) => Err(TransportError::SetupError),
         }
     }
+}
 
+impl Transport for UdpTransport {
     async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
         let len = self
             .socket
