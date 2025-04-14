@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, Packet, ResponseType};
@@ -24,26 +25,27 @@ pub enum TransportError {
     SetupError,
 }
 
-trait Transport {
+#[async_trait]
+pub trait Transport: Sized {
+    async fn from_address<A: ToSocketAddrs + Send>(address: A) -> Result<Self, TransportError>;
     async fn send(&self, msg: TransportMessage) -> Result<(), Error>;
     async fn receive(&self) -> Result<TransportMessage, Error>;
 }
 
-struct UdpTransport {
+pub struct UdpTransport {
     socket: UdpSocket,
 }
 
-impl UdpTransport {
-    async fn from_address<A: ToSocketAddrs>(address: A) -> Result<Self, TransportError> {
+#[async_trait]
+impl Transport for UdpTransport {
+    async fn from_address<A: ToSocketAddrs + Send>(address: A) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(address).await;
         match socket {
             Ok(socket) => Ok(UdpTransport { socket }),
             Err(_) => Err(TransportError::SetupError),
         }
     }
-}
 
-impl Transport for UdpTransport {
     async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
         let len = self
             .socket
@@ -61,13 +63,13 @@ impl Transport for UdpTransport {
     }
 }
 
-pub struct Lwm2mServer {
-    transport: UdpTransport,
+pub struct Lwm2mServer<T: Transport> {
+    transport: T,
 }
 
-impl Lwm2mServer {
+impl<T: Transport> Lwm2mServer<T> {
     pub async fn new(address: &str) -> Self {
-        let transport = UdpTransport::from_address(address)
+        let transport = T::from_address(address)
             .await
             .expect("Failed to initialize transport");
 
@@ -106,6 +108,8 @@ impl Lwm2mServer {
     }
 }
 
+pub type Lwm2mServerUdp = Lwm2mServer<UdpTransport>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +122,7 @@ mod tests {
 
     fn spawn_server_for_tests(server_address: &'static str) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let s = Lwm2mServer::new(server_address).await;
+            let s: Lwm2mServerUdp = Lwm2mServerUdp::new(server_address).await;
             s.run().await.unwrap();
         })
     }
