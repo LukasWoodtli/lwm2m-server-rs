@@ -4,7 +4,7 @@ use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, Packet, ResponseType};
 use std::io::Error;
 use std::net::SocketAddr;
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::net::UdpSocket;
 
 pub struct TransportMessage {
     peer_addr: SocketAddr,
@@ -26,8 +26,7 @@ pub enum TransportError {
 }
 
 #[async_trait]
-pub trait Transport: Sized {
-    async fn from_address<A: ToSocketAddrs + Send>(address: A) -> Result<Self, TransportError>;
+pub trait Transport: Send + Sync {
     async fn send(&self, msg: TransportMessage) -> Result<(), Error>;
     async fn receive(&self) -> Result<TransportMessage, Error>;
 }
@@ -36,16 +35,18 @@ pub struct UdpTransport {
     socket: UdpSocket,
 }
 
-#[async_trait]
-impl Transport for UdpTransport {
-    async fn from_address<A: ToSocketAddrs + Send>(address: A) -> Result<Self, TransportError> {
+impl UdpTransport {
+    async fn from_address(address: &str) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(address).await;
         match socket {
             Ok(socket) => Ok(UdpTransport { socket }),
             Err(_) => Err(TransportError::SetupError),
         }
     }
+}
 
+#[async_trait]
+impl Transport for UdpTransport {
     async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
         let len = self
             .socket
@@ -63,15 +64,17 @@ impl Transport for UdpTransport {
     }
 }
 
-pub struct Lwm2mServer<T: Transport> {
-    transport: T,
+pub struct Lwm2mServer {
+    transport: Box<dyn Transport>,
 }
 
-impl<T: Transport> Lwm2mServer<T> {
-    pub async fn new(address: &str) -> Self {
-        let transport = T::from_address(address)
-            .await
-            .expect("Failed to initialize transport");
+impl Lwm2mServer {
+    pub async fn new_udp(address: &str) -> Self {
+        let transport = Box::new(
+            UdpTransport::from_address(address)
+                .await
+                .expect("Failed to initialize transport"),
+        );
 
         Lwm2mServer { transport }
     }
@@ -108,8 +111,6 @@ impl<T: Transport> Lwm2mServer<T> {
     }
 }
 
-pub type Lwm2mServerUdp = Lwm2mServer<UdpTransport>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,7 +123,7 @@ mod tests {
 
     fn spawn_server_for_tests(server_address: &'static str) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let s: Lwm2mServerUdp = Lwm2mServerUdp::new(server_address).await;
+            let s: Lwm2mServer = Lwm2mServer::new_udp(server_address).await;
             s.run().await.unwrap();
         })
     }
