@@ -3,16 +3,15 @@ use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, Packet, ResponseType};
 use std::io::Error;
-use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
 pub struct TransportMessage {
-    peer_addr: SocketAddr,
+    peer_addr: String,
     message_buf: Vec<u8>,
 }
 
 impl TransportMessage {
-    fn new(peer_addr: SocketAddr, message_buf: Vec<u8>) -> Self {
+    fn new(peer_addr: String, message_buf: Vec<u8>) -> Self {
         TransportMessage {
             peer_addr,
             message_buf,
@@ -27,8 +26,8 @@ pub enum TransportError {
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn send(&self, msg: TransportMessage) -> Result<(), Error>;
-    async fn receive(&self) -> Result<TransportMessage, Error>;
+    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error>;
+    async fn receive(&mut self) -> Result<TransportMessage, Error>;
 }
 
 pub struct UdpTransport {
@@ -47,20 +46,21 @@ impl UdpTransport {
 
 #[async_trait]
 impl Transport for UdpTransport {
-    async fn send(&self, msg: TransportMessage) -> Result<(), Error> {
-        let len = self
+    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
+        let _len = self
             .socket
             .send_to(&msg.message_buf[..], msg.peer_addr)
             .await?;
-        println!("Sent {} bytes", len);
         Ok(())
     }
 
-    async fn receive(&self) -> Result<TransportMessage, Error> {
+    async fn receive(&mut self) -> Result<TransportMessage, Error> {
         let mut buf = vec![0; 1024];
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        println!("Received {} bytes from {:?}", len, addr);
-        Ok(TransportMessage::new(addr, Vec::from(&buf[..len])))
+        Ok(TransportMessage::new(
+            addr.to_string(),
+            Vec::from(&buf[..len]),
+        ))
     }
 }
 
@@ -78,7 +78,11 @@ impl Lwm2mServer {
 
         Lwm2mServer { transport }
     }
-    pub async fn run(self) -> std::io::Result<()> {
+
+    pub async fn new_from_transport(transport: Box<dyn Transport>) -> Self {
+        Lwm2mServer { transport }
+    }
+    pub async fn run(mut self) -> std::io::Result<()> {
         loop {
             let msg = self.transport.receive().await?;
 
@@ -90,7 +94,7 @@ impl Lwm2mServer {
 
     async fn handle_message(&self, msg: TransportMessage) -> Result<TransportMessage, Error> {
         if let Ok(packet) = Packet::from_bytes(&msg.message_buf[..]) {
-            let request = CoapRequest::from_packet(packet, msg.peer_addr);
+            let request = CoapRequest::from_packet(packet, msg.peer_addr.clone());
 
             if let Some(mut response) = request.response {
                 response.set_status(ResponseType::Created);
@@ -101,7 +105,7 @@ impl Lwm2mServer {
                     .add_option_as(LocationPath, OptionValueString("01234".to_owned()));
 
                 if let Ok(buffer) = response.message.to_bytes() {
-                    return Ok(TransportMessage::new(msg.peer_addr, buffer));
+                    return Ok(TransportMessage::new(msg.peer_addr.clone(), buffer));
                 } else {
                     todo!()
                 }
@@ -118,27 +122,43 @@ mod tests {
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
-    use tokio::net::UdpSocket;
+    use tokio::net::unix::SocketAddr;
     use tokio::task::JoinHandle;
+    use tokio_bichannel::{channel, Channel};
 
-    fn spawn_server_for_tests(server_address: &'static str) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let s: Lwm2mServer = Lwm2mServer::new_udp(server_address).await;
-            s.run().await.unwrap();
-        })
+    struct InMemoryTransport {
+        channel: Channel<Vec<u8>, Vec<u8>>,
     }
 
-    async fn run_test_client(server_address: &str, req: &[u8]) -> Result<Packet, Error> {
-        let client_address = "[::1]:5690";
-        let client_socket = UdpSocket::bind(client_address).await?;
-        client_socket.connect(server_address).await?;
+    impl InMemoryTransport {
+        fn new(channel: Channel<Vec<u8>, Vec<u8>>) -> Self {
+            InMemoryTransport { channel }
+        }
+    }
 
-        let _len = client_socket.send(req).await?;
+    #[async_trait]
+    impl Transport for InMemoryTransport {
+        async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
+            self.channel.send(msg.message_buf).await.unwrap();
+            Ok(())
+        }
 
-        let mut buf = vec![0; 1024];
-        let len = client_socket.recv(&mut buf).await?;
-        let resp = Packet::from_bytes(&buf[..len]).unwrap();
-        Ok(resp)
+        async fn receive(&mut self) -> Result<TransportMessage, Error> {
+            let buf = self.channel.recv().await.unwrap();
+            Ok(TransportMessage::new("127.0.0.1".to_string(), buf))
+        }
+    }
+
+    fn spawn_server_for_tests() -> (JoinHandle<()>, Channel<Vec<u8>, Vec<u8>>) {
+        let (client_com, server_com) = channel::<Vec<u8>, Vec<u8>>(1);
+        let transport = Box::new(InMemoryTransport::new(server_com));
+        (
+            tokio::spawn(async move {
+                let s: Lwm2mServer = Lwm2mServer::new_from_transport(transport).await;
+                s.run().await.unwrap();
+            }),
+            client_com,
+        )
     }
 
     fn create_reg_message_for_tests() -> CoapRequest<SocketAddr> {
@@ -168,14 +188,14 @@ mod tests {
     }
     #[tokio::test]
     async fn test_registration_msg() -> std::io::Result<()> {
-        let server_address = "[::1]:5683";
-
-        let _server = spawn_server_for_tests(server_address);
+        let (_server, mut server_comm) = spawn_server_for_tests();
 
         let req = create_reg_message_for_tests();
         let req = req.message.to_bytes().unwrap();
 
-        let resp = run_test_client(server_address, &req).await?;
+        server_comm.send(req).await.unwrap();
+        let resp = &server_comm.recv().await.unwrap();
+        let resp = Packet::from_bytes(resp).unwrap();
 
         assert_eq!(resp.header.get_type(), MessageType::Acknowledgement);
         assert_eq!(resp.header.code, Response(Created));
