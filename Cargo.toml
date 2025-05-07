@@ -10,4 +10,5 @@ async-trait = "0.1.88"
 
 [dev-dependencies]
 tokio-bichannel = "1"
+cargo-llvm-cov = "0.6.16"
 
