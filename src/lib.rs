@@ -1,68 +1,9 @@
-use async_trait::async_trait;
+mod transport;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, Packet, ResponseType};
 use std::io::Error;
-use tokio::net::UdpSocket;
-
-pub struct TransportMessage {
-    peer_addr: String,
-    message_buf: Vec<u8>,
-}
-
-impl TransportMessage {
-    fn new(peer_addr: String, message_buf: Vec<u8>) -> Self {
-        TransportMessage {
-            peer_addr,
-            message_buf,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum TransportError {
-    SetupError,
-}
-
-#[async_trait]
-pub trait Transport: Send + Sync {
-    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error>;
-    async fn receive(&mut self) -> Result<TransportMessage, Error>;
-}
-
-pub struct UdpTransport {
-    socket: UdpSocket,
-}
-
-impl UdpTransport {
-    async fn from_address(address: &str) -> Result<Self, TransportError> {
-        let socket = UdpSocket::bind(address).await;
-        match socket {
-            Ok(socket) => Ok(UdpTransport { socket }),
-            Err(_) => Err(TransportError::SetupError),
-        }
-    }
-}
-
-#[async_trait]
-impl Transport for UdpTransport {
-    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
-        let _len = self
-            .socket
-            .send_to(&msg.message_buf[..], msg.peer_addr)
-            .await?;
-        Ok(())
-    }
-
-    async fn receive(&mut self) -> Result<TransportMessage, Error> {
-        let mut buf = vec![0; 1024];
-        let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        Ok(TransportMessage::new(
-            addr.to_string(),
-            Vec::from(&buf[..len]),
-        ))
-    }
-}
+use transport::{Transport, TransportMessage, UdpTransport};
 
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
@@ -118,6 +59,7 @@ impl Lwm2mServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::tests::InMemoryTransport;
     use coap_lite::option_value::OptionValueString;
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
@@ -125,29 +67,6 @@ mod tests {
     use tokio::net::unix::SocketAddr;
     use tokio::task::JoinHandle;
     use tokio_bichannel::{channel, Channel};
-
-    struct InMemoryTransport {
-        channel: Channel<Vec<u8>, Vec<u8>>,
-    }
-
-    impl InMemoryTransport {
-        fn new(channel: Channel<Vec<u8>, Vec<u8>>) -> Self {
-            InMemoryTransport { channel }
-        }
-    }
-
-    #[async_trait]
-    impl Transport for InMemoryTransport {
-        async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
-            self.channel.send(msg.message_buf).await.unwrap();
-            Ok(())
-        }
-
-        async fn receive(&mut self) -> Result<TransportMessage, Error> {
-            let buf = self.channel.recv().await.unwrap();
-            Ok(TransportMessage::new("127.0.0.1".to_string(), buf))
-        }
-    }
 
     fn spawn_server_for_tests() -> (JoinHandle<()>, Channel<Vec<u8>, Vec<u8>>) {
         let (client_com, server_com) = channel::<Vec<u8>, Vec<u8>>(1);
