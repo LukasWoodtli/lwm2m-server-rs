@@ -306,7 +306,6 @@ dependencies = [
  "cargo-llvm-cov",
  "coap-lite",
  "tokio",
- "tokio-bichannel",
 ]
 
 [[package]]
@@ -611,15 +610,6 @@ dependencies = [
  "socket2",
  "tokio-macros",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "tokio-bichannel"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b64b19ef2761c8a31a94a3b8fa71392b15f9104cafd9eb7ccbc531e79f0ec33"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
