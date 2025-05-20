@@ -96,13 +96,15 @@ impl Lwm2mServer {
         if let Ok(packet) = Packet::from_bytes(&msg.message_buf[..]) {
             let request = CoapRequest::from_packet(packet, msg.peer_addr.clone());
 
+            let reg_id = format!("regid_{}", msg.peer_addr.chars().last().unwrap());
+
             if let Some(mut response) = request.response {
                 response.set_status(ResponseType::Created);
                 response.message.clear_all_options();
                 response.message.add_option(LocationPath, b"rd".to_vec());
                 response
                     .message
-                    .add_option_as(LocationPath, OptionValueString("01234".to_owned()));
+                    .add_option_as(LocationPath, OptionValueString(reg_id));
 
                 if let Ok(buffer) = response.message.to_bytes() {
                     return Ok(TransportMessage::new(msg.peer_addr.clone(), buffer));
@@ -122,7 +124,7 @@ mod tests {
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tokio::net::unix::SocketAddr;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::task::JoinHandle;
@@ -246,7 +248,7 @@ mod tests {
         assert_eq!(resp.header.code, Response(Created));
         assert!(resp.payload.is_empty());
 
-        let values = ["rd", "01234"];
+        let values = ["rd", "regid_1"];
 
         let expected = values
             .iter()
@@ -267,8 +269,9 @@ mod tests {
 
         assert_eq!(client_and_server.clients.len(), 2);
 
-        for _ in 0..client_and_server.clients.len() {
-            let test_client = &mut client_and_server.clients[0];
+        let mut reg_ids: HashSet<String> = HashSet::new();
+        for i in 0..client_and_server.clients.len() {
+            let test_client = &mut client_and_server.clients[i];
             test_client.send_to_server(req.clone()).await;
             let resp = &test_client.from_server_receiver.recv().await.unwrap();
             let resp = Packet::from_bytes(&resp.message_buf).unwrap();
@@ -277,15 +280,24 @@ mod tests {
             assert_eq!(resp.header.code, Response(Created));
             assert!(resp.payload.is_empty());
 
-            let values = ["rd", "01234"];
+            let location_path = resp
+                .get_options_as::<OptionValueString>(LocationPath)
+                .unwrap();
+            let mut iter = location_path.iter();
+            assert_eq!(
+                iter.next(),
+                Some(Ok(OptionValueString("rd".to_owned()))).as_ref()
+            );
 
-            let expected = values
-                .iter()
-                .map(|&x| Ok(OptionValueString(x.to_owned())))
-                .collect();
-            let actual = resp.get_options_as::<OptionValueString>(LocationPath);
-            assert_eq!(actual, Some(expected));
+            let actual_regid = iter.next();
+            let actual_regid = actual_regid.unwrap();
+            let actual_regid = actual_regid.as_ref().unwrap().0.to_owned();
+
+            assert!(!reg_ids.contains(&actual_regid));
+            reg_ids.insert(actual_regid);
         }
+
+        assert_eq!(reg_ids.len(), client_and_server.clients.len());
 
         Ok(())
     }
