@@ -122,31 +122,34 @@ mod tests {
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
+    use std::collections::HashMap;
     use tokio::net::unix::SocketAddr;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::task::JoinHandle;
 
     struct InMemoryTransport {
         to_server: Receiver<TransportMessage>,
-        from_server: Sender<TransportMessage>,
+        clients: HashMap<String, Sender<TransportMessage>>,
     }
 
     impl InMemoryTransport {
-        fn new(
-            to_server: Receiver<TransportMessage>,
-            from_server: Sender<TransportMessage>,
-        ) -> Self {
+        fn new(to_server: Receiver<TransportMessage>) -> Self {
             InMemoryTransport {
                 to_server,
-                from_server,
+                clients: HashMap::new(),
             }
+        }
+
+        fn add_client(&mut self, address: &str, to_client: Sender<TransportMessage>) {
+            self.clients.insert(address.to_string(), to_client);
         }
     }
 
     #[async_trait]
     impl Transport for InMemoryTransport {
         async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
-            self.from_server.send(msg).await.unwrap();
+            let client = self.clients.get(&msg.peer_addr).unwrap();
+            client.send(msg).await.unwrap();
             Ok(())
         }
 
@@ -156,8 +159,18 @@ mod tests {
     }
 
     struct TestClient {
+        address: String,
         to_server_sender: Sender<TransportMessage>,
         from_server_receiver: Receiver<TransportMessage>,
+    }
+
+    impl TestClient {
+        async fn send_to_server(&self, msg_buf: Vec<u8>) {
+            self.to_server_sender
+                .send(TransportMessage::new(self.address.clone(), msg_buf))
+                .await
+                .unwrap()
+        }
     }
 
     struct TestClientsAndServer {
@@ -165,26 +178,31 @@ mod tests {
         clients: Vec<TestClient>,
     }
 
-    fn spawn_server_for_tests() -> TestClientsAndServer {
+    fn spawn_server_for_tests(num_clients: u8) -> TestClientsAndServer {
         let (to_server_sender, to_server_receiver) = tokio::sync::mpsc::channel(1);
-        let (from_server_sender, from_server_receiver) = tokio::sync::mpsc::channel(1);
 
-        let client = TestClient {
-            to_server_sender,
-            from_server_receiver,
-        };
+        let mut transport = Box::new(InMemoryTransport::new(to_server_receiver));
 
-        let transport = Box::new(InMemoryTransport::new(
-            to_server_receiver,
-            from_server_sender,
-        ));
+        let mut clients = Vec::with_capacity(num_clients as usize);
+        for i in 0..num_clients {
+            let (from_server_sender, from_server_receiver) = tokio::sync::mpsc::channel(1);
+            let address = format!("2025:beef::{}", i + 1);
+
+            transport.add_client(&address.clone(), from_server_sender);
+
+            clients.push(TestClient {
+                address,
+                to_server_sender: to_server_sender.clone(),
+                from_server_receiver,
+            });
+        }
 
         TestClientsAndServer {
             _server_join_handle: tokio::spawn(async move {
                 let s: Lwm2mServer = Lwm2mServer::new_from_transport(transport).await;
                 s.run().await.unwrap();
             }),
-            clients: vec![client],
+            clients,
         }
     }
 
@@ -215,14 +233,12 @@ mod tests {
     }
     #[tokio::test]
     async fn test_registration_msg() -> std::io::Result<()> {
-        let mut client_and_server = spawn_server_for_tests();
+        let mut client_and_server = spawn_server_for_tests(1);
 
         let req = create_reg_message_for_tests();
         let req = req.message.to_bytes().unwrap();
-        let req = TransportMessage::new("127.0.0.1".to_string(), req);
-
         let test_client = &mut client_and_server.clients[0];
-        test_client.to_server_sender.send(req).await.unwrap();
+        test_client.send_to_server(req).await;
         let resp = &test_client.from_server_receiver.recv().await.unwrap();
         let resp = Packet::from_bytes(&resp.message_buf).unwrap();
 
@@ -238,6 +254,38 @@ mod tests {
             .collect();
         let actual = resp.get_options_as::<OptionValueString>(LocationPath);
         assert_eq!(actual, Some(expected));
+
+        Ok(())
+    }
+    #[tokio::test]
+
+    async fn test_registration_msg_2_clients() -> std::io::Result<()> {
+        let mut client_and_server = spawn_server_for_tests(2);
+
+        let req = create_reg_message_for_tests();
+        let req = req.message.to_bytes().unwrap();
+
+        assert_eq!(client_and_server.clients.len(), 2);
+
+        for _ in 0..client_and_server.clients.len() {
+            let test_client = &mut client_and_server.clients[0];
+            test_client.send_to_server(req.clone()).await;
+            let resp = &test_client.from_server_receiver.recv().await.unwrap();
+            let resp = Packet::from_bytes(&resp.message_buf).unwrap();
+
+            assert_eq!(resp.header.get_type(), MessageType::Acknowledgement);
+            assert_eq!(resp.header.code, Response(Created));
+            assert!(resp.payload.is_empty());
+
+            let values = ["rd", "01234"];
+
+            let expected = values
+                .iter()
+                .map(|&x| Ok(OptionValueString(x.to_owned())))
+                .collect();
+            let actual = resp.get_options_as::<OptionValueString>(LocationPath);
+            assert_eq!(actual, Some(expected));
+        }
 
         Ok(())
     }
