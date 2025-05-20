@@ -123,42 +123,69 @@ mod tests {
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
     use tokio::net::unix::SocketAddr;
+    use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::task::JoinHandle;
-    use tokio_bichannel::{channel, Channel};
 
     struct InMemoryTransport {
-        channel: Channel<Vec<u8>, Vec<u8>>,
+        to_server: Receiver<TransportMessage>,
+        from_server: Sender<TransportMessage>,
     }
 
     impl InMemoryTransport {
-        fn new(channel: Channel<Vec<u8>, Vec<u8>>) -> Self {
-            InMemoryTransport { channel }
+        fn new(
+            to_server: Receiver<TransportMessage>,
+            from_server: Sender<TransportMessage>,
+        ) -> Self {
+            InMemoryTransport {
+                to_server,
+                from_server,
+            }
         }
     }
 
     #[async_trait]
     impl Transport for InMemoryTransport {
         async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
-            self.channel.send(msg.message_buf).await.unwrap();
+            self.from_server.send(msg).await.unwrap();
             Ok(())
         }
 
         async fn receive(&mut self) -> Result<TransportMessage, Error> {
-            let buf = self.channel.recv().await.unwrap();
-            Ok(TransportMessage::new("127.0.0.1".to_string(), buf))
+            Ok(self.to_server.recv().await.unwrap())
         }
     }
 
-    fn spawn_server_for_tests() -> (JoinHandle<()>, Channel<Vec<u8>, Vec<u8>>) {
-        let (client_com, server_com) = channel::<Vec<u8>, Vec<u8>>(1);
-        let transport = Box::new(InMemoryTransport::new(server_com));
-        (
-            tokio::spawn(async move {
+    struct TestClient {
+        to_server_sender: Sender<TransportMessage>,
+        from_server_receiver: Receiver<TransportMessage>,
+    }
+
+    struct TestClientsAndServer {
+        _server_join_handle: JoinHandle<()>,
+        clients: Vec<TestClient>,
+    }
+
+    fn spawn_server_for_tests() -> TestClientsAndServer {
+        let (to_server_sender, to_server_receiver) = tokio::sync::mpsc::channel(1);
+        let (from_server_sender, from_server_receiver) = tokio::sync::mpsc::channel(1);
+
+        let client = TestClient {
+            to_server_sender,
+            from_server_receiver,
+        };
+
+        let transport = Box::new(InMemoryTransport::new(
+            to_server_receiver,
+            from_server_sender,
+        ));
+
+        TestClientsAndServer {
+            _server_join_handle: tokio::spawn(async move {
                 let s: Lwm2mServer = Lwm2mServer::new_from_transport(transport).await;
                 s.run().await.unwrap();
             }),
-            client_com,
-        )
+            clients: vec![client],
+        }
     }
 
     fn create_reg_message_for_tests() -> CoapRequest<SocketAddr> {
@@ -188,14 +215,16 @@ mod tests {
     }
     #[tokio::test]
     async fn test_registration_msg() -> std::io::Result<()> {
-        let (_server, mut server_comm) = spawn_server_for_tests();
+        let mut client_and_server = spawn_server_for_tests();
 
         let req = create_reg_message_for_tests();
         let req = req.message.to_bytes().unwrap();
+        let req = TransportMessage::new("127.0.0.1".to_string(), req);
 
-        server_comm.send(req).await.unwrap();
-        let resp = &server_comm.recv().await.unwrap();
-        let resp = Packet::from_bytes(resp).unwrap();
+        let test_client = &mut client_and_server.clients[0];
+        test_client.to_server_sender.send(req).await.unwrap();
+        let resp = &test_client.from_server_receiver.recv().await.unwrap();
+        let resp = Packet::from_bytes(&resp.message_buf).unwrap();
 
         assert_eq!(resp.header.get_type(), MessageType::Acknowledgement);
         assert_eq!(resp.header.code, Response(Created));
