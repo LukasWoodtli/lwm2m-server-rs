@@ -69,7 +69,7 @@ async fn test_registration_msg() -> std::io::Result<()> {
     assert_eq!(resp.header.code, Response(Created));
     assert!(resp.payload.is_empty());
 
-    let values = ["rd", "01234"];
+    let values = ["rd", "regid_0"];
 
     let expected = values
         .iter()
