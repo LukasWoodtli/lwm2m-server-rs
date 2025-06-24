@@ -7,6 +7,7 @@ edition = "2021"
 tokio = {version = "^1.44", features = ["macros", "net", "rt", "sync"]}
 coap-lite = "^0.13.1"
 async-trait = "0.1.88"
+log = "0.4.27"
 
 [dev-dependencies]
 cargo-llvm-cov = "0.6.16"
