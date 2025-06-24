@@ -1,7 +1,7 @@
 mod transport;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
-use coap_lite::{CoapRequest, Packet, ResponseType};
+use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
 use std::io::Error;
 use transport::{Transport, TransportMessage, UdpTransport};
 
@@ -37,24 +37,35 @@ impl Lwm2mServer {
         if let Ok(packet) = Packet::from_bytes(&msg.message_buf[..]) {
             let request = CoapRequest::from_packet(packet, msg.peer_addr.clone());
 
-            let reg_id = format!("regid_{}", msg.peer_addr.chars().last().unwrap());
-
-            if let Some(mut response) = request.response {
-                response.set_status(ResponseType::Created);
-                response.message.clear_all_options();
-                response.message.add_option(LocationPath, b"rd".to_vec());
-                response
-                    .message
-                    .add_option_as(LocationPath, OptionValueString(reg_id));
-
-                if let Ok(buffer) = response.message.to_bytes() {
-                    return Ok(TransportMessage::new(msg.peer_addr.clone(), buffer));
-                } else {
+            let path = request.get_path().clone();
+            let method = request.get_method();
+            let response = match (path.as_str(), method) {
+                ("rd", RequestType::Post) => self.handle_registration(request).await,
+                _ => {
                     todo!()
                 }
+            };
+
+            if let Some(response) = response {
+                let buffer = response.message.to_bytes().unwrap_or_else(|_| Vec::new());
+                return Ok(TransportMessage::new(msg.peer_addr.clone(), buffer));
             }
         }
         todo!();
+    }
+
+    async fn handle_registration(&self, request: CoapRequest<String>) -> Option<CoapResponse> {
+        if let Some(mut response) = request.response {
+            let reg_id = format!("regid_{}", request.source.unwrap().chars().last().unwrap());
+            response.set_status(ResponseType::Created);
+            response.message.clear_all_options();
+            response.message.add_option(LocationPath, b"rd".to_vec());
+            response
+                .message
+                .add_option_as(LocationPath, OptionValueString(reg_id));
+            return Some(response);
+        }
+        None
     }
 }
 
