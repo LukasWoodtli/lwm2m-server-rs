@@ -69,14 +69,20 @@ async fn test_registration_msg() -> std::io::Result<()> {
     assert_eq!(resp.header.code, Response(Created));
     assert!(resp.payload.is_empty());
 
-    let values = ["rd", "regid_0"];
-
-    let expected = values
-        .iter()
-        .map(|&x| Ok(OptionValueString(x.to_owned())))
-        .collect();
     let actual = resp.get_options_as::<OptionValueString>(LocationPath);
-    assert_eq!(actual, Some(expected));
+    let actual = actual.unwrap();
+    let actual = actual
+        .iter()
+        .map(|x| x.as_ref().cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), 2);
+    let rd = actual[0].as_ref().unwrap();
+    assert_eq!(rd.0, "rd");
+
+    let reg_id = actual[1].as_ref().unwrap();
+    let reg_id = &reg_id.0;
+    assert_eq!(reg_id.len(), 10);
+    assert!(reg_id.chars().all(char::is_alphanumeric));
 
     Ok(())
 }
