@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::io::Error;
 use tokio::net::UdpSocket;
 
 pub struct TransportMessage {
@@ -18,13 +17,15 @@ impl TransportMessage {
 
 #[derive(Debug)]
 pub enum TransportError {
-    SetupError,
+    Setup,
+    Send,
+    Receive,
 }
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error>;
-    async fn receive(&mut self) -> Result<TransportMessage, Error>;
+    async fn send(&mut self, msg: TransportMessage) -> Result<(), TransportError>;
+    async fn receive(&mut self) -> Result<TransportMessage, TransportError>;
 }
 
 pub struct UdpTransport {
@@ -36,28 +37,33 @@ impl UdpTransport {
         let socket = UdpSocket::bind(address).await;
         match socket {
             Ok(socket) => Ok(UdpTransport { socket }),
-            Err(_) => Err(TransportError::SetupError),
+            Err(_) => Err(TransportError::Setup),
         }
     }
 }
 
 #[async_trait]
 impl Transport for UdpTransport {
-    async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
-        let _len = self
+    async fn send(&mut self, msg: TransportMessage) -> Result<(), TransportError> {
+        match self
             .socket
             .send_to(&msg.message_buf[..], msg.peer_addr)
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => Err(TransportError::Send),
+        }
     }
 
-    async fn receive(&mut self) -> Result<TransportMessage, Error> {
+    async fn receive(&mut self) -> Result<TransportMessage, TransportError> {
         let mut buf = vec![0; 1024];
-        let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        Ok(TransportMessage::new(
-            addr.to_string(),
-            Vec::from(&buf[..len]),
-        ))
+        match self.socket.recv_from(&mut buf).await {
+            Ok((len, addr)) => Ok(TransportMessage::new(
+                addr.to_string(),
+                Vec::from(&buf[..len]),
+            )),
+            Err(_) => return Err(TransportError::Receive),
+        }
     }
 }
 
@@ -88,13 +94,13 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl Transport for InMemoryTransport {
-        async fn send(&mut self, msg: TransportMessage) -> Result<(), Error> {
+        async fn send(&mut self, msg: TransportMessage) -> Result<(), TransportError> {
             let client = self.clients.get(&msg.peer_addr).unwrap();
             client.send(msg).await.unwrap();
             Ok(())
         }
 
-        async fn receive(&mut self) -> Result<TransportMessage, Error> {
+        async fn receive(&mut self) -> Result<TransportMessage, TransportError> {
             Ok(self.to_server.recv().await.unwrap())
         }
     }
@@ -104,6 +110,6 @@ pub(crate) mod tests {
         let server_address = "invalid_address";
         let res = UdpTransport::from_address(server_address).await;
         assert!(res.is_err());
-        assert!(matches!(res, Err(TransportError::SetupError)));
+        assert!(matches!(res, Err(TransportError::Setup)));
     }
 }

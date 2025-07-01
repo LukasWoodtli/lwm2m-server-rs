@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 fn spawn_server_for_tests(server_address: &'static str) -> JoinHandle<()> {
     tokio::spawn(async move {
         let s: Lwm2mServer = Lwm2mServer::new_udp(server_address).await;
-        s.run().await.unwrap();
+        s.run().await;
     })
 }
 
