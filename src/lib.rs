@@ -2,6 +2,8 @@ mod transport;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
+use rand::distr::Alphanumeric;
+use rand::Rng;
 use std::io::Error;
 use transport::{Transport, TransportMessage, UdpTransport};
 
@@ -54,9 +56,17 @@ impl Lwm2mServer {
         todo!();
     }
 
+    fn generate_registration_id(&self) -> String {
+        rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(10)
+            .map(char::from)
+            .collect()
+    }
+
     async fn handle_registration(&self, request: CoapRequest<String>) -> Option<CoapResponse> {
         if let Some(mut response) = request.response {
-            let reg_id = format!("regid_{}", request.source.unwrap().chars().last().unwrap());
+            let reg_id = self.generate_registration_id();
             response.set_status(ResponseType::Created);
             response.message.clear_all_options();
             response.message.add_option(LocationPath, b"rd".to_vec());
@@ -170,14 +180,20 @@ mod tests {
         assert_eq!(resp.header.code, Response(Created));
         assert!(resp.payload.is_empty());
 
-        let values = ["rd", "regid_1"];
-
-        let expected = values
+        let actual = resp
+            .get_options_as::<OptionValueString>(LocationPath)
+            .unwrap();
+        let actual = actual
             .iter()
-            .map(|&x| Ok(OptionValueString(x.to_owned())))
-            .collect();
-        let actual = resp.get_options_as::<OptionValueString>(LocationPath);
-        assert_eq!(actual, Some(expected));
+            .map(|x| x.as_ref().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), 2);
+        let rd = actual[0].as_ref().unwrap();
+        assert_eq!(rd.0, "rd");
+        let reg_id = actual[1].as_ref().unwrap();
+        let reg_id = &reg_id.0;
+        assert_eq!(reg_id.len(), 10);
+        assert!(reg_id.chars().all(char::is_alphanumeric));
 
         Ok(())
     }
