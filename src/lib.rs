@@ -4,8 +4,18 @@ use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
 use rand::distr::Alphanumeric;
 use rand::Rng;
-use std::io::Error;
 use transport::{Transport, TransportMessage, UdpTransport};
+
+#[derive(Debug)]
+pub enum ServerError {
+    CoapParsing,
+    WrongPathOrMethod,
+}
+
+pub struct Lwm2mPacket<'a> {
+    pub message: CoapRequest<String>,
+    pub transport_message: &'a TransportMessage,
+}
 
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
@@ -25,26 +35,44 @@ impl Lwm2mServer {
     pub async fn new_from_transport(transport: Box<dyn Transport>) -> Self {
         Lwm2mServer { transport }
     }
-    pub async fn run(mut self) -> std::io::Result<()> {
+
+    pub async fn run(mut self) {
         loop {
-            let msg = self.transport.receive().await?;
-
-            let response = self.handle_message(msg).await?;
-
-            self.transport.send(response).await?;
+            if let Ok(msg) = self.transport.receive().await {
+                let response = self.handle_message(msg).await;
+                match response {
+                    Ok(response) => {
+                        self.transport.send(response).await.unwrap_or_else(|e| {
+                            eprintln!("Error sending response: {e:?}");
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Error handling message: {e:?}");
+                    }
+                }
+            }
         }
     }
 
-    async fn handle_message(&self, msg: TransportMessage) -> Result<TransportMessage, Error> {
+    async fn handle_message(&self, msg: TransportMessage) -> Result<TransportMessage, ServerError> {
         if let Ok(packet) = Packet::from_bytes(&msg.message_buf[..]) {
-            let request = CoapRequest::from_packet(packet, msg.peer_addr.clone());
+            let lwm2m_packet = Lwm2mPacket {
+                message: CoapRequest::from_packet(packet, msg.peer_addr.clone()),
+                transport_message: &msg,
+            };
 
-            let path = request.get_path().clone();
-            let method = request.get_method();
+            let path = lwm2m_packet.message.get_path().clone();
+            let method = lwm2m_packet.message.get_method();
             let response = match (path.as_str(), method) {
-                ("rd", RequestType::Post) => self.handle_registration(request).await,
+                ("rd", RequestType::Post) => self.handle_registration(lwm2m_packet).await,
                 _ => {
-                    todo!()
+                    if let Some(mut resp) = lwm2m_packet.message.response {
+                        resp.set_status(ResponseType::InternalServerError);
+                        resp.message.clear_all_options();
+                        Some(resp)
+                    } else {
+                        return Err(ServerError::WrongPathOrMethod);
+                    }
                 }
             };
 
@@ -53,7 +81,7 @@ impl Lwm2mServer {
                 return Ok(TransportMessage::new(msg.peer_addr.clone(), buffer));
             }
         }
-        todo!();
+        Err(ServerError::CoapParsing)
     }
 
     fn generate_registration_id(&self) -> String {
@@ -64,8 +92,8 @@ impl Lwm2mServer {
             .collect()
     }
 
-    async fn handle_registration(&self, request: CoapRequest<String>) -> Option<CoapResponse> {
-        if let Some(mut response) = request.response {
+    async fn handle_registration(&self, packet: Lwm2mPacket<'_>) -> Option<CoapResponse> {
+        if let Some(mut response) = packet.message.response {
             let reg_id = self.generate_registration_id();
             response.set_status(ResponseType::Created);
             response.message.clear_all_options();
@@ -134,7 +162,7 @@ mod tests {
         TestClientsAndServer {
             _server_join_handle: tokio::spawn(async move {
                 let s: Lwm2mServer = Lwm2mServer::new_from_transport(transport).await;
-                s.run().await.unwrap();
+                s.run().await;
             }),
             clients,
         }
@@ -197,8 +225,29 @@ mod tests {
 
         Ok(())
     }
-    #[tokio::test]
 
+    #[tokio::test]
+    async fn test_wrong_path() -> std::io::Result<()> {
+        let mut client_and_server = spawn_server_for_tests(1);
+
+        let mut req: CoapRequest<SocketAddr> = CoapRequest::new();
+
+        req.set_method(RequestType::Post);
+        req.message.header.set_type(MessageType::Confirmable);
+
+        req.set_path("/wrong_url");
+
+        let req = req.message.to_bytes().unwrap();
+        let test_client = &mut client_and_server.clients[0];
+        test_client.send_to_server(req).await;
+        let resp = &test_client.from_server_receiver.recv().await.unwrap();
+        let resp = Packet::from_bytes(&resp.message_buf).unwrap();
+        assert_eq!(resp.header.get_code(), "5.00");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_registration_msg_2_clients() -> std::io::Result<()> {
         let mut client_and_server = spawn_server_for_tests(2);
 
