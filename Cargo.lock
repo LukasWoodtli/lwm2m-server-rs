@@ -318,6 +318,7 @@ dependencies = [
  "cargo-llvm-cov",
  "coap-lite",
  "rand",
+ "regex",
  "tokio",
 ]
 

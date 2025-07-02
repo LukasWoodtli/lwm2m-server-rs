@@ -111,10 +111,15 @@ impl Lwm2mServer {
 mod tests {
     use super::*;
     use crate::transport::tests::InMemoryTransport;
+    use coap_lite::link_format::{
+        LinkFormatWrite, LINK_ATTR_CONTENT_FORMAT, LINK_ATTR_RESOURCE_TYPE,
+    };
     use coap_lite::option_value::OptionValueString;
+    use coap_lite::ContentFormat::ApplicationSenmlCBOR;
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
+    use regex::Regex;
     use std::collections::HashSet;
     use tokio::net::unix::SocketAddr;
     use tokio::sync::mpsc::{Receiver, Sender};
@@ -188,8 +193,26 @@ mod tests {
             .message
             .add_option(CoapOption::UriQuery, b"lt=86400".to_vec());
 
-        request.message.payload =
-            br#"</>;rt="oma.lwm2m";ct=112,</1/1>,</3>;ver=1.0,</3/0>,</5>;ver=1.0,</5/0>"#.to_vec();
+        let mut buffer = String::new();
+        let mut write = LinkFormatWrite::new(&mut buffer);
+
+        let ct: usize = ApplicationSenmlCBOR.into();
+        write
+            .link("/")
+            .attr_quoted(LINK_ATTR_RESOURCE_TYPE, "oma.lwm2m")
+            .attr(LINK_ATTR_CONTENT_FORMAT, &ct.to_string());
+        write.link("/1/1");
+        write.link("/3").attr("ver", "1.0");
+        write.link("/3/0");
+        write.link("/5").attr("ver", "1.0");
+        write.link("/5/0");
+        write.finish().unwrap();
+
+        // Workaround: dot separated version numbers are escaped in `coap-lite`
+        let r = Regex::new(r#"ver="([0-9.]+)""#).unwrap();
+        let link = r.replace_all(buffer.as_str(), "ver=$1").to_string();
+
+        request.message.payload = link.into_bytes();
 
         request
     }
