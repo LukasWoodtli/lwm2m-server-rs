@@ -1,0 +1,10 @@
+        let mut parser = LinkFormatParser::new(&link);
+        while let Some(i) = parser.next() {
+            let i = i.unwrap();
+            let n = i.0;
+            let la = i.1;
+            println!("{}", n);
+            for (k, v) in la {
+                println!("\t{}: {}", k, v);
+            }
+        }

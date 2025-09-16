@@ -1,4 +1,6 @@
+mod clients;
 mod transport;
+
 use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
@@ -120,7 +122,10 @@ mod tests {
     use coap_lite::ResponseType::Created;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
     use regex::Regex;
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
+    use std::sync::Mutex;
     use tokio::net::unix::SocketAddr;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::task::JoinHandle;
@@ -141,11 +146,12 @@ mod tests {
     }
 
     struct TestClientsAndServer {
+        server: Rc<RefCell<Lwm2mServer>>,
         _server_join_handle: JoinHandle<()>,
         clients: Vec<TestClient>,
     }
 
-    fn spawn_server_for_tests(num_clients: u8) -> TestClientsAndServer {
+    async fn spawn_server_for_tests(num_clients: u8) -> TestClientsAndServer {
         let (to_server_sender, to_server_receiver) = tokio::sync::mpsc::channel(1);
 
         let mut transport = Box::new(InMemoryTransport::new(to_server_receiver));
@@ -164,9 +170,14 @@ mod tests {
             });
         }
 
+        let server = Rc::new(RefCell::new(
+            Lwm2mServer::new_from_transport(transport).await,
+        ));
+
         TestClientsAndServer {
+            server: server.clone(),
             _server_join_handle: tokio::spawn(async move {
-                let s: Lwm2mServer = Lwm2mServer::new_from_transport(transport).await;
+                let s = server.clone().borrow_mut();
                 s.run().await;
             }),
             clients,
@@ -218,11 +229,11 @@ mod tests {
     }
     #[tokio::test]
     async fn test_registration_msg() -> std::io::Result<()> {
-        let mut client_and_server = spawn_server_for_tests(1);
+        let client_and_server = spawn_server_for_tests(1);
 
         let req = create_reg_message_for_tests();
         let req = req.message.to_bytes().unwrap();
-        let test_client = &mut client_and_server.clients[0];
+        let test_client = &mut client_and_server.await.clients[0];
         test_client.send_to_server(req).await;
         let resp = &test_client.from_server_receiver.recv().await.unwrap();
         let resp = Packet::from_bytes(&resp.message_buf).unwrap();
@@ -251,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_path() -> std::io::Result<()> {
-        let mut client_and_server = spawn_server_for_tests(1);
+        let client_and_server = spawn_server_for_tests(1);
 
         let mut req: CoapRequest<SocketAddr> = CoapRequest::new();
 
@@ -261,7 +272,7 @@ mod tests {
         req.set_path("/wrong_url");
 
         let req = req.message.to_bytes().unwrap();
-        let test_client = &mut client_and_server.clients[0];
+        let test_client = &mut client_and_server.await.clients[0];
         test_client.send_to_server(req).await;
         let resp = &test_client.from_server_receiver.recv().await.unwrap();
         let resp = Packet::from_bytes(&resp.message_buf).unwrap();
@@ -272,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_msg_2_clients() -> std::io::Result<()> {
-        let mut client_and_server = spawn_server_for_tests(2);
+        let mut client_and_server = spawn_server_for_tests(2).await;
 
         let req = create_reg_message_for_tests();
         let req = req.message.to_bytes().unwrap();
