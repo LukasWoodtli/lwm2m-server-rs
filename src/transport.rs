@@ -1,7 +1,11 @@
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
 
+/// A message sent or received over a transport layer.
+///
+/// Contains the peer's address and the raw message bytes.
 pub struct TransportMessage {
+    /// The address of the remote peer (e.g., `"192.168.1.1:5683"`).
     pub peer_addr: String,
     pub message_buf: Vec<u8>,
 }
@@ -15,6 +19,7 @@ impl TransportMessage {
     }
 }
 
+/// Errors that can occur during transport operations.
 #[derive(Debug)]
 pub enum TransportError {
     Setup,
@@ -22,12 +27,31 @@ pub enum TransportError {
     Receive,
 }
 
+/// A trait for abstracting the transport layer used by the LwM2M server.
+///
+/// Implementations handle sending and receiving raw messages over
+/// a specific protocol (e.g., UDP, DTLS, or in-memory for testing).
 #[async_trait]
 pub trait Transport: Send + Sync {
+    /// Sends a message to the specified peer.
+    ///
+    /// # Arguments
+    /// * `msg` - The transport message containing the destination address and payload.
+    ///
+    /// # Errors
+    /// Returns [`TransportError::Send`] if the message could not be sent.
     async fn send(&mut self, msg: TransportMessage) -> Result<(), TransportError>;
+
+    /// Receives a message from the transport.
+    ///
+    /// This method blocks until a message is available.
+    ///
+    /// # Errors
+    /// Returns [`TransportError::Receive`] if an error occurs while receiving.
     async fn receive(&mut self) -> Result<TransportMessage, TransportError>;
 }
 
+/// A UDP-based transport implementation for CoAP/LwM2M communication.
 pub struct UdpTransport {
     socket: UdpSocket,
 }

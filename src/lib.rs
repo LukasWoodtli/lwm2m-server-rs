@@ -6,22 +6,36 @@ use rand::distr::Alphanumeric;
 use rand::Rng;
 use transport::{Transport, TransportMessage, UdpTransport};
 
+/// Errors that can occur during server operations.
 #[derive(Debug)]
 pub enum ServerError {
     CoapParsing,
     WrongPathOrMethod,
 }
 
+/// A parsed LwM2M packet containing the CoAP request and underlying transport message.
 pub struct Lwm2mPacket<'a> {
+    /// The parsed CoAP request.
     pub message: CoapRequest<String>,
     pub transport_message: &'a TransportMessage,
 }
 
+/// An LwM2M server that handles device bootstrap, registration and management.
+///
+/// The server listens for incoming CoAP messages over a configured transport
+/// and responds according to the LwM2M protocol specification.
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
 }
 
 impl Lwm2mServer {
+    /// Creates a new LwM2M server bound to a UDP socket at the given address.
+    ///
+    /// # Arguments
+    /// * `address` - The socket address to bind to (e.g., `"0.0.0.0:5683"`).
+    ///
+    /// # Panics
+    /// Panics if the UDP socket cannot be bound to the specified address.
     pub async fn new_udp(address: &str) -> Self {
         let transport = Box::new(
             UdpTransport::from_address(address)
@@ -32,10 +46,19 @@ impl Lwm2mServer {
         Lwm2mServer { transport }
     }
 
+    /// Creates a new LwM2M server using a custom transport implementation.
+    ///
+    /// # Arguments
+    /// * `transport` - A boxed transport implementing the `Transport` trait.
     pub async fn new_from_transport(transport: Box<dyn Transport>) -> Self {
         Lwm2mServer { transport }
     }
 
+    /// Starts the server's main event loop.
+    ///
+    /// This method runs indefinitely, receiving messages from the transport,
+    /// processing them, and sending responses back to clients.
+    /// Errors during message handling are logged to stderr.
     pub async fn run(mut self) {
         loop {
             if let Ok(msg) = self.transport.receive().await {
