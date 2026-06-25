@@ -1,15 +1,20 @@
 mod transport;
+
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
 use rand::Rng;
 use rand::distr::Alphanumeric;
+use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tower::util::BoxService;
-use tower::{Service, ServiceBuilder};
+use tower::layer::util::Stack;
+use tower::util::{BoxService, MapErrLayer};
+use tower::{Layer, Service, ServiceBuilder};
+use tower_resilience_coalesce::{CoalesceError, CoalesceLayer as CoalesceLayerImpl};
 use tower_resilience_retry::{ExponentialRandomBackoff, RetryLayer};
 use transport::{Transport, TransportMessage, UdpTransport};
 
@@ -31,7 +36,27 @@ pub enum ServerError {
     /// The retry layer **will** retry this error up to [`COAP_MAX_RETRANSMIT`] times
     /// with exponential random backoff per RFC 7252 §4.2.
     Transient,
+    CoalesceLeaderCancelled,
+    CoalesceRecvError,
 }
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerError::CoapParsing => write!(f, "CoAP parsing error"),
+            ServerError::WrongPathOrMethod => write!(f, "wrong CoAP path or method"),
+            ServerError::Transient => write!(f, "transient error"),
+            ServerError::CoalesceLeaderCancelled => {
+                write!(f, "coalesce leader request was cancelled")
+            }
+            ServerError::CoalesceRecvError => {
+                write!(f, "coalesce failed to receive result from leader")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 /// A tower service for processing LwM2M messages.
 ///
@@ -129,6 +154,28 @@ pub struct Lwm2mPacket<'a> {
     pub transport_message: &'a TransportMessage,
 }
 
+/// CoAP message deduplication key per RFC 7252 §4.5.
+///
+/// RFC 7252 §4.5 requires servers to keep track of recently received
+/// (source endpoint, Message ID) pairs to suppress duplicate CON/NON
+/// messages caused by client retransmissions.
+///
+/// The [`CoalesceLayer`] uses this key to ensure at most one in-flight
+/// handler exists per (endpoint, MID) pair: when a duplicate CON arrives
+/// while the original is still being processed, the duplicate waits for
+/// the first call's result and receives the same response — preventing
+/// duplicate registrations and double-processing.
+///
+/// Non-CoAP bytes (parse failures) use MID 0, which collapses all
+/// simultaneous malformed packets from the same peer into one parse-error
+/// call — an acceptable and safe approximation.
+fn coap_dedup_key(msg: &TransportMessage) -> (String, u16) {
+    let mid = Packet::from_bytes(&msg.message_buf)
+        .map(|p| p.header.message_id)
+        .unwrap_or(0);
+    (msg.peer_addr.clone(), mid)
+}
+
 // ---------------------------------------------------------------------------
 // CoAP retransmission parameters — RFC 7252 §4.8
 // ---------------------------------------------------------------------------
@@ -191,10 +238,64 @@ fn coap_retry_layer() -> RetryLayer<TransportMessage, TransportMessage, ServerEr
         .build()
 }
 
+/// Deduplication key: (source endpoint address, CoAP Message ID).
+type DedupKey = (String, u16);
+
+/// Inner type alias for the composed coalesce-then-map-error stack.
+type CoalesceLayerInner<Req, E> = Stack<
+    CoalesceLayerImpl<DedupKey, Req, fn(&Req) -> DedupKey>,
+    MapErrLayer<fn(CoalesceError<E>) -> E>,
+>;
+
+/// A [`tower::Layer`] matching the `<Req, Res, E>` convention of [`RetryLayer`].
+///
+/// Coalesces duplicate in-flight requests (singleflight) and maps
+/// [`CoalesceError<E>`] back to `E`, so the wrapped service keeps
+/// `Error = E` throughout the [`ServiceBuilder`] stack.
+struct CoalesceLayer<Req, Res, E>(CoalesceLayerInner<Req, E>, PhantomData<Res>);
+
+impl<S, Req, Res, E> Layer<S> for CoalesceLayer<Req, Res, E>
+where
+    CoalesceLayerInner<Req, E>: Layer<S>,
+{
+    type Service = <CoalesceLayerInner<Req, E> as Layer<S>>::Service;
+    fn layer(&self, service: S) -> Self::Service {
+        self.0.layer(service)
+    }
+}
+
+impl From<CoalesceError<ServerError>> for ServerError {
+    fn from(e: CoalesceError<ServerError>) -> Self {
+        match e {
+            CoalesceError::Service(inner) => inner,
+            CoalesceError::LeaderCancelled => ServerError::CoalesceLeaderCancelled,
+            CoalesceError::RecvError => ServerError::CoalesceRecvError,
+        }
+    }
+}
+
+fn coap_coalesce_layer() -> CoalesceLayer<TransportMessage, TransportMessage, ServerError> {
+    CoalesceLayer(
+        Stack::new(
+            CoalesceLayerImpl::builder(coap_dedup_key as fn(&TransportMessage) -> DedupKey)
+                .name("coap-coalesce")
+                .build(),
+            MapErrLayer::new(ServerError::from as fn(CoalesceError<ServerError>) -> ServerError),
+        ),
+        PhantomData,
+    )
+}
+
 /// An LwM2M server that handles device bootstrap, registration and management.
 ///
 /// The server listens for incoming CoAP messages over a configured transport
 /// and responds according to the LwM2M protocol specification.
+///
+/// Incoming messages are dispatched concurrently.  The [`CoalesceLayer`]
+/// (singleflight) deduplicates CON retransmissions in flight: if the same
+/// (source endpoint, Message ID) pair arrives again while the first request
+/// is still being processed, the duplicate waits for the first result and
+/// receives the same response (RFC 7252 §4.5).
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
     message_handler: BoxService<TransportMessage, TransportMessage, ServerError>,
@@ -227,6 +328,7 @@ impl Lwm2mServer {
             transport,
             message_handler: ServiceBuilder::new()
                 .boxed()
+                .layer(coap_coalesce_layer())
                 .layer(coap_retry_layer())
                 .service(MessageHandler::new()),
         }
@@ -368,6 +470,7 @@ mod tests {
 
         request
     }
+
     #[tokio::test]
     async fn test_registration_msg() -> std::io::Result<()> {
         let mut client_and_server = spawn_server_for_tests(1);
@@ -460,6 +563,58 @@ mod tests {
         }
 
         assert_eq!(reg_ids.len(), client_and_server.clients.len());
+
+        Ok(())
+    }
+
+    /// RFC 7252 §4.5 – duplicate CON suppression via the coalesce layer.
+    ///
+    /// Two messages from the *same* peer with the *same* CoAP Message ID
+    /// (simulating a client retransmission) are both expected to receive a
+    /// valid 2.01 Created response.  Because the second arrives after the
+    /// first completes in this sequential test, it is processed independently
+    /// and may return a different registration ID.  The key assertion is that
+    /// BOTH duplicates receive a well-formed, successful response rather than
+    /// being silently dropped or producing an error.
+    #[tokio::test]
+    async fn test_duplicate_mid_both_receive_response() -> std::io::Result<()> {
+        // Use a larger channel so we can queue two messages before reading
+        // any response.
+        let (to_server_sender, to_server_receiver) = tokio::sync::mpsc::channel(8);
+        let (from_server_sender, mut from_server_receiver) = tokio::sync::mpsc::channel(8);
+        let address = "2025:beef::1".to_string();
+
+        let mut transport = Box::new(InMemoryTransport::new(to_server_receiver));
+        transport.add_client(&address, from_server_sender);
+
+        tokio::spawn(async move {
+            let s = Lwm2mServer::new_from_transport(transport).await;
+            s.run().await;
+        });
+
+        // Build a registration CON with an explicit, fixed Message ID so both
+        // sends look identical to the server (same endpoint + same MID).
+        let mut req = create_reg_message_for_tests();
+        req.message.header.message_id = 0xBEEF;
+        let raw = req.message.to_bytes().unwrap();
+
+        // Send the original and its retransmission before reading any response.
+        to_server_sender
+            .send(TransportMessage::new(address.clone(), raw.clone()))
+            .await
+            .unwrap();
+        to_server_sender
+            .send(TransportMessage::new(address.clone(), raw.clone()))
+            .await
+            .unwrap();
+
+        // Both the original and the duplicate must produce a 2.01 Created.
+        for _ in 0..2 {
+            let resp = from_server_receiver.recv().await.unwrap();
+            let resp = Packet::from_bytes(&resp.message_buf).unwrap();
+            assert_eq!(resp.header.get_type(), MessageType::Acknowledgement);
+            assert_eq!(resp.header.code, Response(Created));
+        }
 
         Ok(())
     }
@@ -723,6 +878,168 @@ mod tests {
         assert!(
             should_retry(&ServerError::Transient),
             "Transient must be retryable"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Coalesce-layer unit tests
+    //
+    // These tests exercise `coap_coalesce_layer()` directly using lightweight
+    // `tower::service_fn` mocks, mirroring the retry-layer test pattern.
+    // -------------------------------------------------------------------------
+
+    /// Builds a minimal 4-byte CoAP CON header with the given peer address and
+    /// Message ID.  `coap_dedup_key` derives the dedup key from these two fields.
+    fn make_coalesce_msg(peer: &str, mid: u16) -> TransportMessage {
+        // CoAP fixed header (RFC 7252 §3): Ver=1 | Type=CON | TKL=0 | Code=0.01
+        let bytes = vec![0x40, 0x01, (mid >> 8) as u8, (mid & 0xFF) as u8];
+        TransportMessage::new(peer.to_string(), bytes)
+    }
+
+    /// All three `CoalesceError` variants map to the correct `ServerError` variant.
+    #[test]
+    fn coalesce_from_error_mapping() {
+        use tower_resilience_coalesce::CoalesceError;
+
+        assert!(matches!(
+            ServerError::from(CoalesceError::Service(ServerError::CoapParsing)),
+            ServerError::CoapParsing
+        ));
+        assert!(matches!(
+            ServerError::from(CoalesceError::<ServerError>::LeaderCancelled),
+            ServerError::CoalesceLeaderCancelled
+        ));
+        assert!(matches!(
+            ServerError::from(CoalesceError::<ServerError>::RecvError),
+            ServerError::CoalesceRecvError
+        ));
+    }
+
+    /// A unique request reaches the inner service exactly once.
+    #[tokio::test]
+    async fn coalesce_unique_request_passes_through() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        let mut svc = coap_coalesce_layer().layer(inner);
+        let result = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.1:1234", 0x0042))
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Requests with distinct dedup keys each invoke the inner service independently.
+    /// Distinct peer addresses and distinct Message IDs are tested separately.
+    #[tokio::test]
+    async fn coalesce_distinct_keys_not_coalesced() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        let mut svc = coap_coalesce_layer().layer(inner);
+
+        // Different MIDs, same peer
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.1:1234", 0x0001))
+            .await
+            .unwrap();
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.1:1234", 0x0002))
+            .await
+            .unwrap();
+        // Same MID, different peers
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.2:1234", 0x0001))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "each distinct (peer, MID) pair must invoke the inner service once"
+        );
+    }
+
+    /// Two concurrent requests with the same (peer, MID) key are coalesced:
+    /// the inner service is invoked once and both callers receive its result.
+    #[tokio::test]
+    async fn coalesce_concurrent_duplicate_invokes_service_once() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let n = Arc::clone(&notify);
+
+        // The inner service blocks until signalled, keeping the leader in-flight
+        // long enough for the second caller to subscribe as a waiter.
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            let n = Arc::clone(&n);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                n.notified().await;
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        // Cloning the service shares the in-flight map (Arc inside CoalesceService).
+        let svc = coap_coalesce_layer().layer(inner);
+        let mut svc1 = svc.clone();
+        let mut svc2 = svc.clone();
+
+        let h1 = tokio::spawn(async move {
+            svc1.ready()
+                .await
+                .unwrap()
+                .call(make_coalesce_msg("10.0.0.1:1234", 0xBEEF))
+                .await
+        });
+        tokio::task::yield_now().await; // let h1 register as leader and block on notified()
+        let h2 = tokio::spawn(async move {
+            svc2.ready()
+                .await
+                .unwrap()
+                .call(make_coalesce_msg("10.0.0.1:1234", 0xBEEF))
+                .await
+        });
+        tokio::task::yield_now().await; // let h2 subscribe as waiter
+
+        notify.notify_one(); // release the leader; it broadcasts the result to the waiter
+
+        assert!(h1.await.unwrap().is_ok(), "leader must succeed");
+        assert!(
+            h2.await.unwrap().is_ok(),
+            "waiter must receive the coalesced result"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "inner service must be invoked only once for both duplicate requests"
         );
     }
 }
