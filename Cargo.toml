@@ -7,9 +7,12 @@ edition = "2024"
 async-trait = "0.1.88"
 coap-lite = "^0.13.1"
 rand = "0.9.1"
-tokio = { version = "^1.44", features = ["macros", "net", "rt", "sync"] }
+tokio = { version = "^1.44", features = ["macros", "net", "rt", "sync", "time"] }
 tower = { version = "0.4.13", features = ["util"] }
+tower-resilience-retry = "0.10.0"
 
 [dev-dependencies]
 cargo-llvm-cov = "0.6.16"
+# test-util enables tokio::time::pause() / start_paused for fast retry tests
+tokio = { version = "^1.44", features = ["test-util"] }
 
