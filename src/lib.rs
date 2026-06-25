@@ -7,14 +7,30 @@ use rand::distr::Alphanumeric;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tower::util::BoxService;
 use tower::{Service, ServiceBuilder};
+use tower_resilience_retry::{ExponentialRandomBackoff, RetryLayer};
 use transport::{Transport, TransportMessage, UdpTransport};
 
 /// Errors that can occur during server operations.
 #[derive(Debug, Clone)]
 pub enum ServerError {
+    /// The incoming bytes could not be parsed as a valid CoAP packet.
+    ///
+    /// This is a **permanent** error: re-processing the same bytes will always
+    /// fail, so the retry layer never retries it.
     CoapParsing,
+    /// The request addressed a path or used a method not handled by this server.
+    ///
+    /// This is a **permanent** error for the same reason as [`CoapParsing`][Self::CoapParsing].
     WrongPathOrMethod,
+    /// A transient failure that may resolve on a subsequent attempt.
+    ///
+    /// Examples include a temporarily unavailable backend resource.
+    /// The retry layer **will** retry this error up to [`COAP_MAX_RETRANSMIT`] times
+    /// with exponential random backoff per RFC 7252 §4.2.
+    Transient,
 }
 
 /// A tower service for processing LwM2M messages.
@@ -113,13 +129,75 @@ pub struct Lwm2mPacket<'a> {
     pub transport_message: &'a TransportMessage,
 }
 
+// ---------------------------------------------------------------------------
+// CoAP retransmission parameters — RFC 7252 §4.8
+// ---------------------------------------------------------------------------
+// LwM2M 1.1 §6.8.1 (UDP binding) defers entirely to RFC 7252; no overrides.
+// LwM2M 1.1 §5.2.9 additionally recommends exponential back-off for DTLS
+// reconnection attempts.
+
+/// RFC 7252 §4.8: base retransmission timeout.
+const COAP_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Jitter fraction applied to each retry interval.
+///
+/// RFC 7252 §4.2 randomises only the *initial* timeout uniformly over
+/// `[ACK_TIMEOUT, ACK_TIMEOUT × ACK_RANDOM_FACTOR]` = `[2 s, 3 s]`.
+/// `ExponentialRandomBackoff` applies symmetric ± jitter at every step,
+/// so `0.25` gives `[1.5 s, 2.5 s]` on the first retry — a reasonable
+/// approximation of the spec's intent to desynchronise senders.
+const COAP_BACKOFF_JITTER: f64 = 0.25;
+
+/// RFC 7252 §4.8: maximum retransmission count after the initial attempt.
+const COAP_MAX_RETRANSMIT: usize = 4;
+
+/// [`MessageHandler`] wrapped with CoAP-paced exponential-random retry
+/// (RFC 7252 §4.2 / §4.8).
+///
+/// Only transient (non-permanent) errors are retried; [`ServerError::CoapParsing`]
+/// and [`ServerError::WrongPathOrMethod`] are returned immediately because
+/// re-processing the same bytes cannot produce a different outcome.
+/// Builds the [`RetryLayer`] with parameters derived from RFC 7252 §4.2 / §4.8.
+///
+/// | Parameter           | RFC 7252 value | Used here                              |
+/// |---------------------|----------------|----------------------------------------|
+/// | `MAX_RETRANSMIT`    | 4              | `max_attempts` = 4 + 1 = **5**         |
+/// | `ACK_TIMEOUT`       | 2 s            | base interval = **2 s**                |
+/// | `ACK_RANDOM_FACTOR` | 1.5            | approximated by ±25 % jitter per step  |
+///
+/// Only **transient** errors are retried.  [`ServerError::CoapParsing`] and
+/// [`ServerError::WrongPathOrMethod`] are permanent: re-sending the same bytes
+/// cannot produce a different outcome.  When future variants representing
+/// transient backend failures are added to [`ServerError`], extend the
+/// `retry_on` predicate to allow them through.
+///
+/// LwM2M 1.1 §6.8.1 specifies no UDP-binding overrides; §5.2.9 recommends
+/// exponential back-off for DTLS reconnections.  Both are consistent with
+/// these RFC 7252 defaults.
+fn coap_retry_layer() -> RetryLayer<TransportMessage, TransportMessage, ServerError> {
+    RetryLayer::builder()
+        .name("coap-request")
+        .max_attempts(COAP_MAX_RETRANSMIT + 1)
+        .backoff(ExponentialRandomBackoff::new(
+            COAP_ACK_TIMEOUT,
+            COAP_BACKOFF_JITTER,
+        ))
+        .retry_on(|err: &ServerError| {
+            !matches!(
+                err,
+                ServerError::CoapParsing | ServerError::WrongPathOrMethod
+            )
+        })
+        .build()
+}
+
 /// An LwM2M server that handles device bootstrap, registration and management.
 ///
 /// The server listens for incoming CoAP messages over a configured transport
 /// and responds according to the LwM2M protocol specification.
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
-    message_handler: MessageHandler,
+    message_handler: BoxService<TransportMessage, TransportMessage, ServerError>,
 }
 
 impl Lwm2mServer {
@@ -147,7 +225,10 @@ impl Lwm2mServer {
     pub async fn new_from_transport(transport: Box<dyn Transport>) -> Self {
         Lwm2mServer {
             transport,
-            message_handler: ServiceBuilder::new().service(MessageHandler::new()),
+            message_handler: ServiceBuilder::new()
+                .boxed()
+                .layer(coap_retry_layer())
+                .service(MessageHandler::new()),
         }
     }
 
@@ -183,10 +264,12 @@ mod tests {
     use coap_lite::option_value::OptionValueString;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::unix::SocketAddr;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::task::JoinHandle;
-    use tower::Service;
+    use tower::{Layer, Service, ServiceExt};
 
     struct TestClient {
         address: String,
@@ -413,5 +496,209 @@ mod tests {
         let result = handler.call(msg).await.unwrap();
         let packet = Packet::from_bytes(&result.message_buf).unwrap();
         assert_eq!(packet.header.get_code(), "5.00");
+    }
+
+    // -------------------------------------------------------------------------
+    // Retry-layer unit tests
+    //
+    // These tests exercise `coap_retry_layer()` directly — the production retry
+    // configuration — using a lightweight `tower::service_fn` mock instead of a
+    // full `Lwm2mServer`.  `start_paused = true` lets Tokio auto-advance time
+    // through backoff sleeps so the tests complete instantly.
+    // -------------------------------------------------------------------------
+
+    /// Builds a minimal `TransportMessage` for use in retry tests.
+    fn make_retry_msg() -> TransportMessage {
+        make_transport_msg(vec![0x40, 0x01, 0x00, 0x01]) // valid-ish CoAP header bytes
+    }
+
+    /// `CoapParsing` is a permanent error: the retry layer must **not** retry it.
+    #[tokio::test(start_paused = true)]
+    async fn retry_coap_parsing_error_is_not_retried() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |_msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err::<TransportMessage, ServerError>(ServerError::CoapParsing)
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(matches!(result, Err(ServerError::CoapParsing)));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "CoapParsing must short-circuit without any retries"
+        );
+    }
+
+    /// `WrongPathOrMethod` is a permanent error: the retry layer must **not** retry it.
+    #[tokio::test(start_paused = true)]
+    async fn retry_wrong_path_or_method_is_not_retried() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |_msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err::<TransportMessage, ServerError>(ServerError::WrongPathOrMethod)
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(matches!(result, Err(ServerError::WrongPathOrMethod)));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "WrongPathOrMethod must short-circuit without any retries"
+        );
+    }
+
+    /// A transient error is retried.  After two failures the service succeeds and
+    /// the retry layer surfaces that success to the caller.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_error_retries_until_success() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                let attempt = cc.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    Err::<TransportMessage, ServerError>(ServerError::Transient)
+                } else {
+                    Ok(msg)
+                }
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(result.is_ok(), "should succeed after retries");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "should attempt exactly 3 times (2 transient failures + 1 success)"
+        );
+    }
+
+    /// A persistent transient error exhausts all `COAP_MAX_RETRANSMIT + 1 = 5`
+    /// attempts and then returns the final error.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_error_exhausts_all_attempts() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |_msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err::<TransportMessage, ServerError>(ServerError::Transient)
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(
+            matches!(result, Err(ServerError::Transient)),
+            "exhausted retries must propagate the last error"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            COAP_MAX_RETRANSMIT + 1,
+            "must attempt exactly COAP_MAX_RETRANSMIT + 1 = 5 times per RFC 7252 §4.8"
+        );
+    }
+
+    /// A request that succeeds immediately is never retried.
+    #[tokio::test(start_paused = true)]
+    async fn retry_success_on_first_attempt_does_not_retry() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a first-attempt success must not trigger any retry"
+        );
+    }
+
+    /// The service succeeds on the very last allowed attempt (`COAP_MAX_RETRANSMIT + 1`).
+    /// This verifies the boundary: the retry layer must not give up one attempt too early.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_error_succeeds_on_final_attempt() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+        let max_attempts = COAP_MAX_RETRANSMIT + 1; // 5
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                let attempt = cc.fetch_add(1, Ordering::SeqCst);
+                if attempt + 1 < max_attempts {
+                    Err::<TransportMessage, ServerError>(ServerError::Transient)
+                } else {
+                    Ok(msg)
+                }
+            }
+        });
+
+        let mut svc = coap_retry_layer().layer(inner);
+        let result = svc.ready().await.unwrap().call(make_retry_msg()).await;
+
+        assert!(
+            result.is_ok(),
+            "must succeed when service recovers on the last attempt"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), max_attempts);
+    }
+
+    /// Unit-tests the retry predicate in isolation — independent of the Tower
+    /// service machinery — to document which variants are permanent vs transient.
+    #[test]
+    fn retry_predicate_classifies_all_error_variants() {
+        // Mirror the closure used inside `coap_retry_layer()`.
+        let should_retry = |err: &ServerError| -> bool {
+            !matches!(
+                err,
+                ServerError::CoapParsing | ServerError::WrongPathOrMethod
+            )
+        };
+
+        assert!(
+            !should_retry(&ServerError::CoapParsing),
+            "CoapParsing must be permanent (not retried)"
+        );
+        assert!(
+            !should_retry(&ServerError::WrongPathOrMethod),
+            "WrongPathOrMethod must be permanent (not retried)"
+        );
+        assert!(
+            should_retry(&ServerError::Transient),
+            "Transient must be retryable"
+        );
     }
 }

@@ -4,6 +4,7 @@ use tokio::net::UdpSocket;
 /// A message sent or received over a transport layer.
 ///
 /// Contains the peer's address and the raw message bytes.
+#[derive(Clone)]
 pub struct TransportMessage {
     /// The address of the remote peer (e.g., `"192.168.1.1:5683"`).
     pub peer_addr: String,
