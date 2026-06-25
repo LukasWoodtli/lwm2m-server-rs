@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "github-copilot/claude-sonnet-4.6",
+  "lsp": true,
+  "mcp": {
+    "lsp_mcp": {
+      "type": "local",
+      "command": ["npx", "-y", "@theupsider/lsp-mcp@latest"],
+      "enabled": true,
+      "cwd": "/home/lukas/projects/sg-bnw-lwm2m-server"
+    },
+    "pdf-reader": {
+      "type": "local",
+      "command": ["npx", "@sylphx/pdf-reader-mcp"],
+      "enabled": true,
+      "cwd": "/home/lukas/projects/lwm2m-server-rs/specs-pdfs"
+    }
+  }
+}
