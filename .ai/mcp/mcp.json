@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "docs-rs": {
+      "command": "npx",
+      "args": [
+        "@nuskey8/docs-rs-mcp@latest",
+        "-y"
+      ]
+    },
+    "lsp-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@theupsider/lsp-mcp@latest"
+      ],
+      "type": "stdio"
+    }
+  }
+}
