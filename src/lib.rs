@@ -234,20 +234,44 @@ impl Lwm2mServer {
 
     /// Starts the server's main event loop.
     ///
-    /// This method runs indefinitely, receiving messages from the transport,
-    /// processing them through the service stack, and sending responses back to clients.
-    /// Errors during message handling are logged to stderr.
+    /// Receives messages from the transport and dispatches each one to a
+    /// dedicated Tokio task.  An internal channel collects responses from
+    /// finished tasks and forwards them back through the transport.
+    ///
+    /// Concurrent dispatch is required for the [`CoalesceLayer`] to coalesce
+    /// duplicate CON retransmissions that arrive while the original is still
+    /// being processed.
     pub async fn run(mut self) {
+        // Each call to `message_handler.call()` returns a `Send + 'static`
+        // future.  We collect them in a `JoinSet` so multiple in-flight
+        // requests can be processed concurrently while the CoalesceLayer
+        // deduplicates CON retransmissions that share the same (endpoint,
+        // Message-ID) key.
+        let mut tasks: tokio::task::JoinSet<Result<TransportMessage, ServerError>> =
+            tokio::task::JoinSet::new();
+
         loop {
-            if let Ok(msg) = self.transport.receive().await {
-                match self.message_handler.call(msg).await {
-                    Ok(response) => {
-                        self.transport.send(response).await.unwrap_or_else(|e| {
-                            eprintln!("Error sending response: {e:?}");
-                        });
+            tokio::select! {
+                // Wait for the next incoming packet.
+                recv_result = self.transport.receive() => {
+                    if let Ok(msg) = recv_result {
+                        tasks.spawn(self.message_handler.call(msg));
                     }
-                    Err(e) => {
-                        eprintln!("Error handling message: {e:?}");
+                }
+                // Forward any response produced by a processing task.
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                    match result {
+                        Ok(Ok(response)) => {
+                            self.transport.send(response).await.unwrap_or_else(|e| {
+                                eprintln!("Error sending response: {e:?}");
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Error handling message: {e:?}");
+                        }
+                        Err(e) => {
+                            eprintln!("Task panicked or was cancelled: {e:?}");
+                        }
                     }
                 }
             }
