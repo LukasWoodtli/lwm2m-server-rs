@@ -16,7 +16,7 @@ jobs:
 
     strategy:
       matrix:
-        rust_version: ["stable", "nightly", "1.81"]
+        rust_version: ["stable", "nightly", "1.94"]
 
     steps:
     - name: Checkout code
