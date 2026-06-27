@@ -1,9 +1,9 @@
 mod transport;
-use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
+use coap_lite::option_value::OptionValueString;
 use coap_lite::{CoapRequest, CoapResponse, Packet, RequestType, ResponseType};
-use rand::distr::Alphanumeric;
 use rand::Rng;
+use rand::distr::Alphanumeric;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -178,9 +178,9 @@ impl Lwm2mServer {
 mod tests {
     use super::*;
     use crate::transport::tests::InMemoryTransport;
-    use coap_lite::option_value::OptionValueString;
     use coap_lite::MessageClass::Response;
     use coap_lite::ResponseType::Created;
+    use coap_lite::option_value::OptionValueString;
     use coap_lite::{CoapOption, CoapRequest, MessageType, RequestType};
     use std::collections::HashSet;
     use tokio::net::unix::SocketAddr;

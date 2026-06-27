@@ -1,7 +1,7 @@
-use coap_lite::option_value::OptionValueString;
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::MessageClass::Response;
 use coap_lite::ResponseType::Created;
+use coap_lite::option_value::OptionValueString;
 use coap_lite::{CoapOption, CoapRequest, MessageType, Packet, RequestType};
 use lwm2m_server_rs::Lwm2mServer;
 use std::io::Error;
