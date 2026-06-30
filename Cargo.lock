@@ -437,6 +437,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru_time_cache"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -452,6 +461,7 @@ dependencies = [
  "rand",
  "tokio",
  "tower 0.4.13",
+ "tower-resilience-cache",
  "tower-resilience-coalesce",
  "tower-resilience-retry",
 ]
@@ -974,6 +984,19 @@ name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
+
+[[package]]
+name = "tower-resilience-cache"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b898ae7d0531ca68b155f8b8a4ba58add3c7e905058a001e84c456d8608e0b4f"
+dependencies = [
+ "futures",
+ "lru",
+ "tokio",
+ "tower 0.5.3",
+ "tower-resilience-core",
+]
 
 [[package]]
 name = "tower-resilience-coalesce"
