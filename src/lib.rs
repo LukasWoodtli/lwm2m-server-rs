@@ -14,6 +14,7 @@ use std::time::Duration;
 use tower::layer::util::Stack;
 use tower::util::{BoxService, MapErrLayer};
 use tower::{Layer, Service, ServiceBuilder};
+use tower_resilience_cache::{CacheError, CacheLayer as CacheLayerImpl, EvictionPolicy};
 use tower_resilience_coalesce::{CoalesceError, CoalesceLayer as CoalesceLayerImpl};
 use tower_resilience_retry::{ExponentialRandomBackoff, RetryLayer};
 use transport::{Transport, TransportMessage, UdpTransport};
@@ -241,6 +242,89 @@ fn coap_retry_layer() -> RetryLayer<TransportMessage, TransportMessage, ServerEr
 /// Deduplication key: (source endpoint address, CoAP Message ID).
 type DedupKey = (String, u16);
 
+// ---------------------------------------------------------------------------
+// CacheLayer — RFC 7252 §4.5 response cache (historical deduplication)
+// ---------------------------------------------------------------------------
+
+/// Inner type alias for the composed cache-then-map-error stack.
+type CacheLayerInner<Req, E> =
+    Stack<CacheLayerImpl<Req, DedupKey>, MapErrLayer<fn(CacheError<E>) -> E>>;
+
+/// RFC 7252 §4.8: assumed maximum one-way network latency.
+const COAP_MAX_LATENCY: Duration = Duration::from_secs(100);
+
+/// RFC 7252 §4.8.2: window in which a CON exchange can remain in flight.
+///
+/// `EXCHANGE_LIFETIME = MAX_TRANSMIT_SPAN + 2 × MAX_LATENCY + PROCESSING_DELAY`
+///                    = 45 s              + 200 s             + 2 s = **247 s**
+///
+/// The server cache retains responses for this duration to replay them for
+/// any retransmitted copy of the same CON (RFC 7252 §4.5).
+const COAP_EXCHANGE_LIFETIME: Duration =
+    Duration::from_secs(45 + 2 * COAP_MAX_LATENCY.as_secs() + 2);
+
+/// A [`tower::Layer`] matching the `<Req, Res, E>` convention of [`RetryLayer`].
+///
+/// Caches successful responses keyed on `(source endpoint, Message ID)` for
+/// [`COAP_EXCHANGE_LIFETIME`] (247 s) and returns the cached response
+/// immediately when a duplicate CON/NON message arrives, without invoking the
+/// inner service again (RFC 7252 §4.5).
+///
+/// This layer sits **outermost** in the middleware stack so that historical
+/// retransmissions are short-circuited before reaching the coalescing and
+/// retry layers.  Errors are not cached; only `Ok(TransportMessage)` responses
+/// are stored.
+///
+/// Eviction uses FIFO so that the oldest entries — those nearest their
+/// natural expiry — are replaced first when the cache reaches capacity.
+struct CacheLayer<Req, Res, E>(CacheLayerInner<Req, E>, PhantomData<Res>);
+
+impl<S, Req, Res, E> Layer<S> for CacheLayer<Req, Res, E>
+where
+    CacheLayerInner<Req, E>: Layer<S>,
+{
+    type Service = <CacheLayerInner<Req, E> as Layer<S>>::Service;
+    fn layer(&self, service: S) -> Self::Service {
+        self.0.layer(service)
+    }
+}
+
+impl From<CacheError<ServerError>> for ServerError {
+    fn from(e: CacheError<ServerError>) -> Self {
+        e.into_inner()
+    }
+}
+
+/// Builds the outermost [`CacheLayer`] that implements RFC 7252 §4.5
+/// duplicate-response caching.
+///
+/// | Parameter            | Value       | Source                      |
+/// |----------------------|-------------|-----------------------------|
+/// | Cache key            | (peer, MID) | RFC 7252 §4.5               |
+/// | TTL                  | 247 s       | `EXCHANGE_LIFETIME` §4.8.2  |
+/// | Max entries          | 1 024       | practical default           |
+/// | Eviction policy      | FIFO        | time-ordered entries        |
+fn coap_cache_layer() -> CacheLayer<TransportMessage, TransportMessage, ServerError> {
+    CacheLayer(
+        Stack::new(
+            CacheLayerImpl::<TransportMessage, DedupKey>::builder()
+                .name("coap-dedup-cache")
+                .max_size(1024)
+                .ttl(COAP_EXCHANGE_LIFETIME)
+                .eviction_policy(EvictionPolicy::Fifo)
+                .key_extractor(coap_dedup_key)
+                .build()
+                .unwrap(),
+            MapErrLayer::new(ServerError::from as fn(CacheError<ServerError>) -> ServerError),
+        ),
+        PhantomData,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CoalesceLayer — concurrent in-flight deduplication (singleflight)
+// ---------------------------------------------------------------------------
+
 /// Inner type alias for the composed coalesce-then-map-error stack.
 type CoalesceLayerInner<Req, E> = Stack<
     CoalesceLayerImpl<DedupKey, Req, fn(&Req) -> DedupKey>,
@@ -328,6 +412,7 @@ impl Lwm2mServer {
             transport,
             message_handler: ServiceBuilder::new()
                 .boxed()
+                .layer(coap_cache_layer())
                 .layer(coap_coalesce_layer())
                 .layer(coap_retry_layer())
                 .service(MessageHandler::new()),
@@ -1040,6 +1125,194 @@ mod tests {
             call_count.load(Ordering::SeqCst),
             1,
             "inner service must be invoked only once for both duplicate requests"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache-layer unit tests
+    //
+    // These tests exercise `coap_cache_layer()` directly using lightweight
+    // `tower::service_fn` mocks.  The cache layer sits outermost in the
+    // production stack and implements RFC 7252 §4.5 response caching: a
+    // response for a given (peer, MID) key is stored on the first successful
+    // call and replayed for any subsequent duplicate within EXCHANGE_LIFETIME.
+    // -------------------------------------------------------------------------
+
+    /// `CacheError::Inner(e)` unwraps back to `e`.
+    #[test]
+    fn cache_from_error_mapping() {
+        use tower_resilience_cache::CacheError;
+
+        let e: ServerError = CacheError::Inner(ServerError::CoapParsing).into();
+        assert!(matches!(e, ServerError::CoapParsing));
+    }
+
+    /// The first call for a key reaches the inner service; the response is cached.
+    /// A second call with the same key returns the cached response without
+    /// invoking the inner service again (RFC 7252 §4.5).
+    #[tokio::test]
+    async fn cache_hit_returns_cached_response_without_calling_service() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        let mut svc = coap_cache_layer().layer(inner);
+        let key_msg = make_coalesce_msg("10.0.0.1:5683", 0x0001);
+
+        // First call — cache miss, inner service invoked.
+        svc.ready()
+            .await
+            .unwrap()
+            .call(key_msg.clone())
+            .await
+            .unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Second call — cache hit, inner service NOT invoked.
+        svc.ready().await.unwrap().call(key_msg).await.unwrap();
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "duplicate (peer, MID) must be served from cache"
+        );
+    }
+
+    /// Requests with distinct dedup keys each miss the cache and invoke the
+    /// inner service independently.
+    #[tokio::test]
+    async fn cache_distinct_keys_each_invoke_service() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        let mut svc = coap_cache_layer().layer(inner);
+
+        // Three distinct keys — one per combination of peer/MID.
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.1:5683", 0x0001))
+            .await
+            .unwrap();
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.1:5683", 0x0002))
+            .await
+            .unwrap();
+        svc.ready()
+            .await
+            .unwrap()
+            .call(make_coalesce_msg("10.0.0.2:5683", 0x0001))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "each distinct (peer, MID) pair must invoke the inner service once"
+        );
+    }
+
+    /// Errors are not cached: if the inner service fails, a subsequent request
+    /// with the same key must retry the inner service (RFC 7252 §4.5 only
+    /// requires caching of responses, not errors).
+    #[tokio::test]
+    async fn cache_errors_are_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        // Service always fails.
+        let inner = tower::service_fn(move |_: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Err::<TransportMessage, ServerError>(ServerError::CoapParsing)
+            }
+        });
+
+        let mut svc = coap_cache_layer().layer(inner);
+        let key_msg = make_coalesce_msg("10.0.0.1:5683", 0xABCD);
+
+        let _ = svc.ready().await.unwrap().call(key_msg.clone()).await;
+        let _ = svc.ready().await.unwrap().call(key_msg).await;
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "failed responses must not be cached; each attempt must reach the inner service"
+        );
+    }
+
+    /// After the TTL elapses, a cached entry expires and the inner service is
+    /// called again for the same key.
+    #[tokio::test]
+    async fn cache_entry_expires_after_ttl() {
+        // Build a one-shot cache with a very short TTL so this test is fast.
+        use tower_resilience_cache::{CacheLayer as CacheLayerImpl, EvictionPolicy};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let inner = tower::service_fn(move |msg: TransportMessage| {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<TransportMessage, ServerError>(msg)
+            }
+        });
+
+        // 50 ms TTL — deliberately short for testing only.
+        let short_ttl_layer = CacheLayerImpl::<TransportMessage, DedupKey>::builder()
+            .max_size(16)
+            .ttl(Duration::from_millis(50))
+            .eviction_policy(EvictionPolicy::Fifo)
+            .key_extractor(coap_dedup_key)
+            .build()
+            .unwrap();
+
+        let mut svc = short_ttl_layer.layer(inner);
+        let key_msg = make_coalesce_msg("10.0.0.1:5683", 0xFACE);
+
+        svc.ready()
+            .await
+            .unwrap()
+            .call(key_msg.clone())
+            .await
+            .unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Cache hit before expiry.
+        svc.ready()
+            .await
+            .unwrap()
+            .call(key_msg.clone())
+            .await
+            .unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "should hit cache");
+
+        // Wait for TTL to elapse, then the entry must be treated as a miss.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        svc.ready().await.unwrap().call(key_msg).await.unwrap();
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "expired cache entry must cause a cache miss"
         );
     }
 }

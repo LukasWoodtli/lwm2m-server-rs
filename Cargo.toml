@@ -9,6 +9,7 @@ coap-lite = "^0.13.1"
 rand = "0.9.1"
 tokio = { version = "^1.44", features = ["macros", "net", "rt", "sync", "time"] }
 tower = { version = "0.4.13", features = ["util"] }
+tower-resilience-cache = "0.10.0"
 tower-resilience-coalesce = "0.10.0"
 tower-resilience-retry = "0.10.0"
 
