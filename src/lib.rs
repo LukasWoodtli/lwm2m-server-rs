@@ -1,4 +1,7 @@
+mod block;
 mod transport;
+
+use block::{BlockLayer, lwm2m_block_handler_config};
 
 use coap_lite::CoapOption::LocationPath;
 use coap_lite::option_value::OptionValueString;
@@ -375,11 +378,15 @@ fn coap_coalesce_layer() -> CoalesceLayer<TransportMessage, TransportMessage, Se
 /// The server listens for incoming CoAP messages over a configured transport
 /// and responds according to the LwM2M protocol specification.
 ///
-/// Incoming messages are dispatched concurrently.  The [`CoalesceLayer`]
-/// (singleflight) deduplicates CON retransmissions in flight: if the same
-/// (source endpoint, Message ID) pair arrives again while the first request
-/// is still being processed, the duplicate waits for the first result and
-/// receives the same response (RFC 7252 §4.5).
+/// Incoming messages pass through a layered middleware stack (outermost first):
+///
+/// | Layer | Purpose |
+/// |-------|---------|
+/// | [`BlockLayer`] | RFC 7959 block-wise transfer (Block1 reassembly, Block2 fragmentation) |
+/// | [`CacheLayer`] | RFC 7252 §4.5 response cache — replays responses for CON retransmissions |
+/// | [`CoalesceLayer`] | Singleflight dedup — concurrent duplicates wait for the leader result |
+/// | [`RetryLayer`] | RFC 7252 §4.2 exponential-backoff retry on transient errors |
+/// | [`MessageHandler`] | CoAP routing and application logic |
 pub struct Lwm2mServer {
     transport: Box<dyn Transport>,
     message_handler: BoxService<TransportMessage, TransportMessage, ServerError>,
@@ -412,6 +419,7 @@ impl Lwm2mServer {
             transport,
             message_handler: ServiceBuilder::new()
                 .boxed()
+                .layer(BlockLayer::new(lwm2m_block_handler_config()))
                 .layer(coap_cache_layer())
                 .layer(coap_coalesce_layer())
                 .layer(coap_retry_layer())
